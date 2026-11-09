@@ -46,6 +46,7 @@ public final class DecorationRecognizer {
         List<DecorationDefinition> definitions = new ArrayList<>();
         Decorations.all().forEach(definitions::add);
         java.util.function.Function<BlockState, DecorationDefinition[]> anchorsFor = anchorLookup(definitions);
+        VariantFeasibility feasibility = new VariantFeasibility(level);
 
         for (int chunkX = minX >> 4; chunkX <= maxX >> 4; chunkX++) {
             for (int chunkZ = minZ >> 4; chunkZ <= maxZ >> 4; chunkZ++) {
@@ -66,7 +67,7 @@ public final class DecorationRecognizer {
                                 if (anchoring.length == 0) continue;
                                 BlockPos anchor = new BlockPos(x, baseY + y, z);
                                 for (DecorationDefinition definition : anchoring) {
-                                    DecorationInstance instance = evaluate(level, definition, anchor, null);
+                                    DecorationInstance instance = evaluate(level, definition, anchor, null, feasibility);
                                     if (instance == null) continue;
                                     if (duplicatesNearby(data, definition, instance)) continue;
                                     live.add(anchor.asLong());
@@ -260,10 +261,18 @@ public final class DecorationRecognizer {
      */
     public static @Nullable DecorationInstance evaluate(ServerLevel level, DecorationDefinition definition,
                                                        BlockPos anchor, @Nullable BlockPos ignore) {
+        return evaluate(level, definition, anchor, ignore, null);
+    }
+
+    /** As above; a village scan passes its {@code feasibility} so hopeless variants skip the block reads. */
+    static @Nullable DecorationInstance evaluate(ServerLevel level, DecorationDefinition definition,
+                                                BlockPos anchor, @Nullable BlockPos ignore,
+                                                @Nullable VariantFeasibility feasibility) {
         if (!level.isLoaded(anchor) || anchor.equals(ignore)) return null;
         if (!definition.isAnchor(level.getBlockState(anchor))) return null;
         int r = definition.radius();
         for (DecorationDefinition.Variant variant : definition.variants()) {
+            if (feasibility != null && !feasibility.possible(variant, anchor, r)) continue;
             DecorationInstance instance = evaluateVariant(level, definition, variant, anchor, ignore);
             if (instance != null) return instance;
         }

@@ -198,7 +198,7 @@ public final class OptionalBuildingRecognition {
         for (int i = 0; i < types.size(); i++) {
             TypeEntry entry = types.get(i);
             List<MatchedBlock> matches = visible.get(i);
-            matches.sort(Comparator.comparingDouble(block -> block.pos().distSqr(center)));
+            sortNearestFirst(matches, center);
             MatchGrid grid = new MatchGrid(matches.size(),
                     i2 -> matches.get(i2).pos().getX(), i2 -> matches.get(i2).pos().getZ());
             // Only saves work: a seed inside a site of this type already found finds it again.
@@ -809,13 +809,28 @@ public final class OptionalBuildingRecognition {
         // two separate stands visible at opposite edges of the scan could satisfy one another's
         // requirements and be registered as a single phantom building.
         long discoverySquared = (long) DISCOVERY_RADIUS * DISCOVERY_RADIUS;
-        BlockPos anchor = nearby(visible, grid, origin, DISCOVERY_RADIUS)
-                .filter(block -> horizontalDistSqr(block.pos(), origin) <= discoverySquared)
-                .filter(block -> !insideRoom(level, rooms, block.pos()))
-                .filter(block -> entry.core() == null || isCore(entry, block))
-                .min(Comparator.<MatchedBlock, Boolean>comparing(block -> block.block() instanceof LiquidBlock)
-                        .thenComparingDouble(block -> block.pos().distSqr(origin)))
-                .map(MatchedBlock::pos).orElse(null);
+        // The nearest solid block (a liquid only when nothing else qualifies) that is not inside a
+        // room. A plain loop over indices: this runs once per seed, and a stream with a boxed
+        // comparator over thousands of neighbours was most of the cost.
+        int[] around = indicesNear(grid, origin, DISCOVERY_RADIUS);
+        BlockPos found = null;
+        boolean foundLiquid = false;
+        double foundDist = 0;
+        for (int n = 0, count = around == null ? visible.size() : around.length; n < count; n++) {
+            int i = around == null ? n : around[n];
+            MatchedBlock block = visible.get(i);
+            if (horizontalDistSqr(block.pos(), origin) > discoverySquared) continue;
+            if (insideRoomAt(level, rooms, grid, i, block.pos())) continue;
+            if (entry.core() != null && !isCore(entry, block)) continue;
+            boolean liquid = block.block() instanceof LiquidBlock;
+            double dist = block.pos().distSqr(origin);
+            if (found == null || (liquid != foundLiquid ? !liquid : dist < foundDist)) {
+                found = block.pos();
+                foundLiquid = liquid;
+                foundDist = dist;
+            }
+        }
+        final BlockPos anchor = found;
         if (anchor == null) return null;
         // The site comes first where a type declares one: its cells, not a radius, decide which
         // ingredients belong. A fence on the far side of the village is not part of this paddock
@@ -845,9 +860,10 @@ public final class OptionalBuildingRecognition {
         Map<ResourceLocation, List<MatchedBlock>> liquids = new LinkedHashMap<>();
         // Without a site footprint every part lies within reach of the anchor, so only that
         // neighbourhood needs reading; a footprint can stretch further and keeps the full list.
-        java.util.stream.Stream<MatchedBlock> partsSource = footprint.isEmpty()
-                ? nearby(visible, grid, anchor, entry.reach()) : visible.stream();
-        for (MatchedBlock matched : (Iterable<MatchedBlock>) partsSource::iterator) {
+        int[] reachable = footprint.isEmpty() ? indicesNear(grid, anchor, entry.reach()) : null;
+        for (int n = 0, count = reachable == null ? visible.size() : reachable.length; n < count; n++) {
+            int i = reachable == null ? n : reachable[n];
+            MatchedBlock matched = visible.get(i);
             if (matched.pos().getY() < floor || matched.pos().getY() > ceiling) continue;
             if (footprint.isEmpty()
                     ? horizontalDistSqr(matched.pos(), anchor) > reachSquared
@@ -855,7 +871,7 @@ public final class OptionalBuildingRecognition {
                             SiteGeometry.column(matched.pos().getX(), matched.pos().getZ()))) continue;
             if (matched.block() instanceof LiquidBlock) {
                 liquids.computeIfAbsent(matched.id(), ignored -> new ArrayList<>()).add(matched);
-            } else if (!insideRoom(level, rooms, matched.pos())) {
+            } else if (!insideRoomAt(level, rooms, grid, i, matched.pos())) {
                 kept.add(matched);
             }
         }
@@ -908,11 +924,44 @@ public final class OptionalBuildingRecognition {
         return origin.getX() >= minX && origin.getX() <= maxX && origin.getZ() >= minZ && origin.getZ() <= maxZ;
     }
 
-    /** The entries that can lie within {@code radius} of {@code center}, in list order (a superset when a grid is used). */
-    private static java.util.stream.Stream<MatchedBlock> nearby(List<MatchedBlock> visible, MatchGrid grid,
-                                                                BlockPos center, int radius) {
-        if (grid == null) return visible.stream();
-        return java.util.Arrays.stream(grid.near(center.getX(), center.getZ(), radius)).mapToObj(visible::get);
+    /** Indices (ascending) that can lie within {@code radius} of {@code center}, or null for "all of them". */
+    private static int[] indicesNear(MatchGrid grid, BlockPos center, int radius) {
+        return grid == null ? null : grid.near(center.getX(), center.getZ(), radius);
+    }
+
+    /** {@link #insideRoom} for entry {@code index} of the list the grid indexes, remembered per entry. */
+    private static boolean insideRoomAt(ServerLevel level, Rooms rooms, MatchGrid grid, int index, BlockPos pos) {
+        if (grid == null) return insideRoom(level, rooms, pos);
+        byte memo = grid.roomMemo[index];
+        if (memo == 0) {
+            memo = (byte) (insideAnyRoom(level, rooms.bounds, pos) ? 2 : 1);
+            grid.roomMemo[index] = memo;
+        }
+        return memo == 2;
+    }
+
+    /**
+     * Stable nearest-first order. The squared distance is a whole number, so it is packed with the
+     * entry's position in the list into one long and the longs are sorted: ties keep their list
+     * order, exactly as a stable comparator sort would, without an object per entry or a distance
+     * recomputed in every comparison.
+     */
+    private static void sortNearestFirst(List<MatchedBlock> list, BlockPos center) {
+        int n = list.size();
+        if (n < 2) return;
+        if (n >= (1 << 24)) {
+            list.sort(Comparator.comparingDouble(block -> block.pos().distSqr(center)));
+            return;
+        }
+        long[] keys = new long[n];
+        for (int i = 0; i < n; i++) {
+            BlockPos pos = list.get(i).pos();
+            long dx = pos.getX() - center.getX(), dy = pos.getY() - center.getY(), dz = pos.getZ() - center.getZ();
+            keys[i] = ((dx * dx + dy * dy + dz * dz) << 24) | i;
+        }
+        java.util.Arrays.sort(keys);
+        MatchedBlock[] original = list.toArray(new MatchedBlock[0]);
+        for (int i = 0; i < n; i++) list.set(i, original[(int) (keys[i] & 0xFFFFFF)]);
     }
 
     private static long horizontalDistSqr(BlockPos a, BlockPos b) {

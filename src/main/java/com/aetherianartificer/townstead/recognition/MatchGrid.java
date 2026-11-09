@@ -19,7 +19,11 @@ final class MatchGrid {
 
     private final Map<Long, int[]> cells;
 
+    /** Scratch for the caller, one byte per entry: 0 unknown, 1 and 2 are the caller's two answers. */
+    final byte[] roomMemo;
+
     MatchGrid(int size, IntUnaryOperator xOf, IntUnaryOperator zOf) {
+        this.roomMemo = new byte[size];
         Map<Long, int[]> built = new HashMap<>();
         // Indices are appended in ascending order, so each cell's list stays sorted.
         for (int i = 0; i < size; i++) {
