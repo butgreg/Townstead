@@ -40,6 +40,12 @@ public final class DecorationRecognizer {
         DecorationSavedData data = DecorationSavedData.get(level);
         Set<Long> live = new HashSet<>();
         int added = 0;
+        // Which definitions anchor on a given block state, worked out once per distinct state for
+        // this refresh. Asking every definition about every block of a 321x321 column was the cost
+        // of a refresh; a village is made of a few hundred distinct states.
+        List<DecorationDefinition> definitions = new ArrayList<>();
+        Decorations.all().forEach(definitions::add);
+        java.util.function.Function<BlockState, DecorationDefinition[]> anchorsFor = anchorLookup(definitions);
 
         for (int chunkX = minX >> 4; chunkX <= maxX >> 4; chunkX++) {
             for (int chunkZ = minZ >> 4; chunkZ <= maxZ >> 4; chunkZ++) {
@@ -48,16 +54,18 @@ public final class DecorationRecognizer {
                 var sections = chunk.getSections();
                 for (int index = 0; index < sections.length; index++) {
                     var section = sections[index];
-                    if (section == null || section.hasOnlyAir()) continue;
+                    if (section == null || section.hasOnlyAir()
+                            || !section.maybeHas(state -> anchorsFor.apply(state).length > 0)) continue;
                     int baseY = chunk.getSectionYFromSectionIndex(index) << 4;
                     for (int x = Math.max(minX, chunkX << 4); x <= Math.min(maxX, (chunkX << 4) + 15); x++) {
                         for (int z = Math.max(minZ, chunkZ << 4); z <= Math.min(maxZ, (chunkZ << 4) + 15); z++) {
                             for (int y = 0; y < 16; y++) {
                                 BlockState state = section.getBlockState(x & 15, y, z & 15);
                                 if (state.isAir()) continue;
+                                DecorationDefinition[] anchoring = anchorsFor.apply(state);
+                                if (anchoring.length == 0) continue;
                                 BlockPos anchor = new BlockPos(x, baseY + y, z);
-                                for (DecorationDefinition definition : Decorations.all()) {
-                                    if (!definition.isAnchor(state)) continue;
+                                for (DecorationDefinition definition : anchoring) {
                                     DecorationInstance instance = evaluate(level, definition, anchor, null);
                                     if (instance == null) continue;
                                     if (duplicatesNearby(data, definition, instance)) continue;
@@ -80,6 +88,17 @@ public final class DecorationRecognizer {
             if (level.isLoaded(anchor) && !live.contains(anchor.asLong())) data.remove(anchor);
         }
         return added;
+    }
+
+    /**
+     * The definitions (in the given order) that anchor on a block state, memoized per state. Valid
+     * for as long as the definitions and block tags do not change, so callers hold it for one scan.
+     */
+    static java.util.function.Function<BlockState, DecorationDefinition[]> anchorLookup(
+            List<DecorationDefinition> definitions) {
+        java.util.Map<BlockState, DecorationDefinition[]> anchoredBy = new java.util.HashMap<>();
+        return state -> anchoredBy.computeIfAbsent(state, key -> definitions.stream()
+                .filter(definition -> definition.isAnchor(key)).toArray(DecorationDefinition[]::new));
     }
 
     public static void onPlaced(ServerLevel level, BlockPos pos, BlockState placed, @Nullable Entity by) {

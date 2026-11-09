@@ -127,7 +127,20 @@ public final class OptionalBuildingRecognition {
     private record Existing(Village village, Building building) {}
     /** {@code core}: the recipe group an anchor must belong to; null lets any part anchor. */
     private record TypeEntry(String name, BuildingType type, int reach, @Nullable ResourceLocation core) {}
-    private record RoomBounds(Village village, Building room) {}
+    /**
+     * A room with its box read once. {@code Building#getPos1} is not a plain getter (it resolves
+     * the building type), and {@code insideAnyRoom} asked for both corners of every room for every
+     * block it tested.
+     */
+    private record RoomBounds(Village village, Building room, int minX, int minY, int minZ,
+                              int maxX, int maxY, int maxZ) {
+        static RoomBounds of(Village village, Building room) {
+            BlockPos min = room.getPos0();
+            BlockPos max = room.getPos1();
+            return new RoomBounds(village, room, min.getX(), min.getY(), min.getZ(),
+                    max.getX(), max.getY(), max.getZ());
+        }
+    }
 
     /** One pass's rooms. Every seed asks about the same blocks, so each answer is kept for the pass. */
     private static final class Rooms {
@@ -135,7 +148,7 @@ public final class OptionalBuildingRecognition {
         private final Map<Long, Boolean> inside = new HashMap<>();
 
         void add(Village village, Building room) {
-            bounds.add(new RoomBounds(village, room));
+            bounds.add(RoomBounds.of(village, room));
         }
     }
 
@@ -186,6 +199,8 @@ public final class OptionalBuildingRecognition {
             TypeEntry entry = types.get(i);
             List<MatchedBlock> matches = visible.get(i);
             matches.sort(Comparator.comparingDouble(block -> block.pos().distSqr(center)));
+            MatchGrid grid = new MatchGrid(matches.size(),
+                    i2 -> matches.get(i2).pos().getX(), i2 -> matches.get(i2).pos().getZ());
             // Only saves work: a seed inside a site of this type already found finds it again.
             Set<Long> covered = new HashSet<>();
             for (MatchedBlock seed : matches) {
@@ -194,7 +209,7 @@ public final class OptionalBuildingRecognition {
                 // Mineshafts and caves under the village are not its buildings.
                 if (seed.pos().getY() < minY - VILLAGE_HEIGHT_MARGIN
                         || seed.pos().getY() > maxY + VILLAGE_HEIGHT_MARGIN) continue;
-                Candidate candidate = assemble(level, scan, seed.pos(), entry, matches, rooms, null);
+                Candidate candidate = assemble(level, scan, seed.pos(), entry, matches, grid, rooms, null);
                 if (candidate == null) continue;
                 candidate.positions().forEach(pos -> covered.add(pos.asLong()));
                 String key = candidate.typeName() + ':' + candidate.min().asLong() + ':' + candidate.max().asLong();
@@ -321,7 +336,7 @@ public final class OptionalBuildingRecognition {
         List<Candidate> found = new ArrayList<>();
         for (int i = 0; i < family.size(); i++) {
             for (BlockPos origin : origins) {
-                Candidate candidate = assemble(level, scan, origin, family.get(i), visible.get(i), rooms, null);
+                Candidate candidate = assemble(level, scan, origin, family.get(i), visible.get(i), null, rooms, null);
                 if (candidate != null && overlaps(candidate, min, max)) found.add(candidate);
             }
         }
@@ -427,7 +442,7 @@ public final class OptionalBuildingRecognition {
                 FENCE_LOOK) >= FENCED_SIDES;
         for (int i = 0; i < types.size(); i++) {
             TypeEntry entry = types.get(i);
-            Candidate candidate = assemble(level, scan, origin, entry, visible.get(i), rooms, found -> {
+            Candidate candidate = assemble(level, scan, origin, entry, visible.get(i), null, rooms, found -> {
                 if (amidFences && problem[0] == null && nearOwnBlock(level, entry.type(), found.at())) {
                     problem[0] = found;
                     problemType[0] = entry.name();
@@ -771,18 +786,20 @@ public final class OptionalBuildingRecognition {
 
     private static boolean insideAnyRoom(ServerLevel level, List<RoomBounds> rooms, BlockPos pos) {
         for (RoomBounds entry : rooms) {
-            BlockPos min = entry.room().getPos0();
-            BlockPos max = entry.room().getPos1();
-            if (pos.getX() < min.getX() || pos.getX() > max.getX()
-                    || pos.getY() < min.getY() || pos.getY() > max.getY()
-                    || pos.getZ() < min.getZ() || pos.getZ() > max.getZ()) continue;
+            if (pos.getX() < entry.minX() || pos.getX() > entry.maxX()
+                    || pos.getY() < entry.minY() || pos.getY() > entry.maxY()
+                    || pos.getZ() < entry.minZ() || pos.getZ() > entry.maxZ()) continue;
             if (McaBuildingCompat.contains(level, entry.village(), entry.room(), pos)) return true;
         }
         return false;
     }
 
+    /**
+     * @param grid an index over {@code visible} (same list, same order), or null to scan the whole
+     *             list. Only changes how candidates are found, never which ones or in what order.
+     */
     private static Candidate assemble(ServerLevel level, SiteRequirements.Scan scan, BlockPos origin,
-                                      TypeEntry entry, List<MatchedBlock> visible, Rooms rooms,
+                                      TypeEntry entry, List<MatchedBlock> visible, MatchGrid grid, Rooms rooms,
                                       java.util.function.Consumer<SiteRequirements.Problem> problems) {
         if (visible.isEmpty()) return null;
         BuildingType type = entry.type();
@@ -792,7 +809,7 @@ public final class OptionalBuildingRecognition {
         // two separate stands visible at opposite edges of the scan could satisfy one another's
         // requirements and be registered as a single phantom building.
         long discoverySquared = (long) DISCOVERY_RADIUS * DISCOVERY_RADIUS;
-        BlockPos anchor = visible.stream()
+        BlockPos anchor = nearby(visible, grid, origin, DISCOVERY_RADIUS)
                 .filter(block -> horizontalDistSqr(block.pos(), origin) <= discoverySquared)
                 .filter(block -> !insideRoom(level, rooms, block.pos()))
                 .filter(block -> entry.core() == null || isCore(entry, block))
@@ -826,7 +843,11 @@ public final class OptionalBuildingRecognition {
 
         List<MatchedBlock> kept = new ArrayList<>();
         Map<ResourceLocation, List<MatchedBlock>> liquids = new LinkedHashMap<>();
-        for (MatchedBlock matched : visible) {
+        // Without a site footprint every part lies within reach of the anchor, so only that
+        // neighbourhood needs reading; a footprint can stretch further and keeps the full list.
+        java.util.stream.Stream<MatchedBlock> partsSource = footprint.isEmpty()
+                ? nearby(visible, grid, anchor, entry.reach()) : visible.stream();
+        for (MatchedBlock matched : (Iterable<MatchedBlock>) partsSource::iterator) {
             if (matched.pos().getY() < floor || matched.pos().getY() > ceiling) continue;
             if (footprint.isEmpty()
                     ? horizontalDistSqr(matched.pos(), anchor) > reachSquared
@@ -885,6 +906,13 @@ public final class OptionalBuildingRecognition {
             minZ = Math.min(minZ, matched.pos().getZ()); maxZ = Math.max(maxZ, matched.pos().getZ());
         }
         return origin.getX() >= minX && origin.getX() <= maxX && origin.getZ() >= minZ && origin.getZ() <= maxZ;
+    }
+
+    /** The entries that can lie within {@code radius} of {@code center}, in list order (a superset when a grid is used). */
+    private static java.util.stream.Stream<MatchedBlock> nearby(List<MatchedBlock> visible, MatchGrid grid,
+                                                                BlockPos center, int radius) {
+        if (grid == null) return visible.stream();
+        return java.util.Arrays.stream(grid.near(center.getX(), center.getZ(), radius)).mapToObj(visible::get);
     }
 
     private static long horizontalDistSqr(BlockPos a, BlockPos b) {
