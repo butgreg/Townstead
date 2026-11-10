@@ -603,6 +603,7 @@ public class Townstead {
             com.aetherianartificer.townstead.compat.vampirism.VampireTotemWatch.tick(e.getServer());
             com.aetherianartificer.townstead.ritual.RitualService.tick(e.getServer());
             com.aetherianartificer.townstead.politics.order.Recruiting.tick(e.getServer());
+            com.aetherianartificer.townstead.recognition.VillageRefreshJobs.tick(e.getServer());
             com.aetherianartificer.townstead.journey.Journeys.tick(e.getServer());
             com.aetherianartificer.townstead.journey.Companions.tick(e.getServer());
             com.aetherianartificer.townstead.journey.Rounds.tick(e.getServer());
@@ -1331,6 +1332,7 @@ public class Townstead {
             com.aetherianartificer.townstead.compat.vampirism.VampireTotemWatch.tick(e.getServer());
             com.aetherianartificer.townstead.ritual.RitualService.tick(e.getServer());
             com.aetherianartificer.townstead.politics.order.Recruiting.tick(e.getServer());
+            com.aetherianartificer.townstead.recognition.VillageRefreshJobs.tick(e.getServer());
             com.aetherianartificer.townstead.journey.Journeys.tick(e.getServer());
             com.aetherianartificer.townstead.journey.Companions.tick(e.getServer());
             com.aetherianartificer.townstead.journey.Rounds.tick(e.getServer());

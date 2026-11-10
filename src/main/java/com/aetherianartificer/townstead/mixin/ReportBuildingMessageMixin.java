@@ -123,7 +123,9 @@ public abstract class ReportBuildingMessageMixin {
                 OptionalBuildingRecognition.Candidate candidate = optionalCandidate.get();
                 BuildingEnclosurePolicies.Mode mode = BuildingEnclosurePolicies.modeOf(candidate.typeName());
                 VillageManager manager = VillageManager.get(level);
-                boolean roomWillHandle = mode.allowsRoom()
+                // A site the player is not standing in (the pen next door) must not take the scan away
+                // from the room they are standing in.
+                boolean roomWillHandle = (mode.allowsRoom() || !candidate.holdsOrigin())
                         && OptionalBuildingRecognition.roomCanHandle(manager, pos, actName);
                 if (!roomWillHandle) {
                     // Several kinds fit this ground: the player says which, as MCA asks for rooms.
@@ -180,19 +182,18 @@ public abstract class ReportBuildingMessageMixin {
                 .findNearestVillage(player)
                 .ifPresent(v -> {
                     if ("FULL_SCAN".equals(actName)) {
-                        OptionalBuildingRecognition.RefreshResult refreshed =
-                                OptionalBuildingRecognition.reconcileVillage(level, v);
-                        int decorations = com.aetherianartificer.townstead.decoration.DecorationRecognizer
-                                .reconcileVillage(level, v);
-                        TOWNSTEAD$LOG.info("Village refresh imported {} open-air buildings, refreshed {}, and imported {} decorations",
-                                refreshed.created(), refreshed.refreshed(), decorations);
-                        var catalog = com.aetherianartificer.townstead.client.catalog.CatalogSyncS2CPayload
-                                .snapshot(level, v);
-                        //? if neoforge {
-                        net.neoforged.neoforge.network.PacketDistributor.sendToPlayer(player, catalog);
-                        //?} else if forge {
-                        /*com.aetherianartificer.townstead.TownsteadNetwork.sendToPlayer(player, catalog);
-                        *///?}
+                        // A whole-village sweep takes tens of seconds, so it runs a slice per tick and the
+                        // rest of this handler follows when it is done.
+                        boolean started = com.aetherianartificer.townstead.recognition.VillageRefreshJobs.start(
+                                level, v, player, (lvl, village, who, outcome) -> {
+                                    TOWNSTEAD$LOG.info("Village refresh imported {} open-air buildings, refreshed {}, and imported {} decorations",
+                                            outcome.createdBuildings(), outcome.refreshedBuildings(), outcome.decorations());
+                                    if (who == null) return;
+                                    townstead$finishRefresh(lvl, village, who, outcome);
+                                });
+                        player.displayClientMessage(net.minecraft.network.chat.Component.translatable(
+                                started ? "townstead.refresh.started" : "townstead.refresh.running"), true);
+                        return;
                     }
                     com.aetherianartificer.townstead.compat.mca.BuildingReportReconciler.reconcile(
                             level, player, v, TOWNSTEAD$LOG);
@@ -201,5 +202,23 @@ public abstract class ReportBuildingMessageMixin {
                     // the client sees the reconciled state.
                     McaFloorCompat.pushVillageResponse(player);
                 });
+    }
+
+    @Unique
+    private static void townstead$finishRefresh(ServerLevel level, net.conczin.mca.server.world.data.Village v,
+                                                ServerPlayer player,
+                                                com.aetherianartificer.townstead.recognition.VillageRefreshJobs.Outcome outcome) {
+        var catalog = com.aetherianartificer.townstead.client.catalog.CatalogSyncS2CPayload
+                .snapshot(level, v);
+        //? if neoforge {
+        net.neoforged.neoforge.network.PacketDistributor.sendToPlayer(player, catalog);
+        //?} else if forge {
+        /*com.aetherianartificer.townstead.TownsteadNetwork.sendToPlayer(player, catalog);
+        *///?}
+        com.aetherianartificer.townstead.compat.mca.BuildingReportReconciler.reconcile(
+                level, player, v, TOWNSTEAD$LOG);
+        McaFloorCompat.pushVillageResponse(player);
+        player.displayClientMessage(net.minecraft.network.chat.Component.translatable("townstead.refresh.done",
+                outcome.createdBuildings(), outcome.refreshedBuildings(), outcome.decorations()), true);
     }
 }

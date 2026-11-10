@@ -28,67 +28,138 @@ public final class DecorationRecognizer {
 
     /** Import naturally generated decorations when the player refreshes a village. */
     public static int reconcileVillage(ServerLevel level, net.conczin.mca.server.world.data.Village village) {
-        if (level == null || village == null || Decorations.isEmpty()) return 0;
-        BlockPos center = new BlockPos(village.getCenter().getX(), village.getCenter().getY(),
-                village.getCenter().getZ());
-        var box = village.getBox();
-        int villageReach = Math.max(Math.max(center.getX() - box.minX(), box.maxX() - center.getX()),
-                Math.max(center.getZ() - box.minZ(), box.maxZ() - center.getZ()));
-        int radius = Math.min(160, Math.max(48, villageReach + 24));
-        int minX = center.getX() - radius, maxX = center.getX() + radius;
-        int minZ = center.getZ() - radius, maxZ = center.getZ() + radius;
-        DecorationSavedData data = DecorationSavedData.get(level);
-        Set<Long> live = new HashSet<>();
-        int added = 0;
-        // Which definitions anchor on a given block state, worked out once per distinct state for
-        // this refresh. Asking every definition about every block of a 321x321 column was the cost
-        // of a refresh; a village is made of a few hundred distinct states.
-        List<DecorationDefinition> definitions = new ArrayList<>();
-        Decorations.all().forEach(definitions::add);
-        java.util.function.Function<BlockState, DecorationDefinition[]> anchorsFor = anchorLookup(definitions);
-        VariantFeasibility feasibility = new VariantFeasibility(level);
+        Refresh refresh = refreshTask(level, village);
+        refresh.runToEnd();
+        return refresh.added();
+    }
 
-        for (int chunkX = minX >> 4; chunkX <= maxX >> 4; chunkX++) {
-            for (int chunkZ = minZ >> 4; chunkZ <= maxZ >> 4; chunkZ++) {
-                if (!level.hasChunk(chunkX, chunkZ)) continue;
-                var chunk = level.getChunk(chunkX, chunkZ);
+    /** The same pass as {@link #reconcileVillage}, in pieces small enough to spread over ticks. */
+    public static Refresh refreshTask(ServerLevel level, net.conczin.mca.server.world.data.Village village) {
+        return new Refresh(level, village);
+    }
+
+    /** A village refresh of decorations, one chunk section at a time. */
+    public static final class Refresh implements com.aetherianartificer.townstead.recognition.TimeSliced {
+        private final ServerLevel level;
+        private final boolean idle;
+        private BlockPos center;
+        private int radius, minX, maxX, minZ, maxZ, lastChunkX, lastChunkZ;
+        private DecorationSavedData data;
+        private final Set<Long> live = new HashSet<>();
+        /** What was on the books when the pass began: a set placed during the pass is not stale. */
+        private final Set<Long> before = new HashSet<>();
+        private int added;
+        private java.util.function.Function<BlockState, DecorationDefinition[]> anchorsFor;
+        private VariantFeasibility feasibility;
+        private int chunkX, chunkZ, sectionIndex;
+        private net.minecraft.world.level.chunk.LevelChunk chunk;
+        private boolean finished;
+
+        private Refresh(ServerLevel level, net.conczin.mca.server.world.data.Village village) {
+            this.level = level;
+            this.idle = level == null || village == null || Decorations.isEmpty();
+            if (idle) return;
+            center = new BlockPos(village.getCenter().getX(), village.getCenter().getY(),
+                    village.getCenter().getZ());
+            var box = village.getBox();
+            int villageReach = Math.max(Math.max(center.getX() - box.minX(), box.maxX() - center.getX()),
+                    Math.max(center.getZ() - box.minZ(), box.maxZ() - center.getZ()));
+            radius = Math.min(160, Math.max(48, villageReach + 24));
+            minX = center.getX() - radius;
+            maxX = center.getX() + radius;
+            minZ = center.getZ() - radius;
+            maxZ = center.getZ() + radius;
+            data = DecorationSavedData.get(level);
+            // Which definitions anchor on a given block state, worked out once per distinct state for
+            // this refresh. Asking every definition about every block of a 321x321 column was the cost
+            // of a refresh; a village is made of a few hundred distinct states.
+            List<DecorationDefinition> definitions = new ArrayList<>();
+            Decorations.all().forEach(definitions::add);
+            anchorsFor = anchorLookup(definitions);
+            feasibility = new VariantFeasibility(level);
+            for (DecorationInstance instance : data.within(center, radius * 2)) before.add(instance.anchor().asLong());
+            chunkX = minX >> 4;
+            chunkZ = minZ >> 4;
+            lastChunkX = maxX >> 4;
+            lastChunkZ = maxZ >> 4;
+        }
+
+        public int added() {
+            return added;
+        }
+
+        @Override
+        public boolean step(long deadline) {
+            if (idle || finished) return true;
+            while (chunkX <= lastChunkX) {
+                if (chunk == null) {
+                    if (!level.hasChunk(chunkX, chunkZ)) {
+                        nextChunk();
+                        continue;
+                    }
+                    chunk = level.getChunk(chunkX, chunkZ);
+                    sectionIndex = 0;
+                }
                 var sections = chunk.getSections();
-                for (int index = 0; index < sections.length; index++) {
-                    var section = sections[index];
-                    if (section == null || section.hasOnlyAir()
-                            || !section.maybeHas(state -> anchorsFor.apply(state).length > 0)) continue;
-                    int baseY = chunk.getSectionYFromSectionIndex(index) << 4;
-                    for (int x = Math.max(minX, chunkX << 4); x <= Math.min(maxX, (chunkX << 4) + 15); x++) {
-                        for (int z = Math.max(minZ, chunkZ << 4); z <= Math.min(maxZ, (chunkZ << 4) + 15); z++) {
-                            for (int y = 0; y < 16; y++) {
-                                BlockState state = section.getBlockState(x & 15, y, z & 15);
-                                if (state.isAir()) continue;
-                                DecorationDefinition[] anchoring = anchorsFor.apply(state);
-                                if (anchoring.length == 0) continue;
-                                BlockPos anchor = new BlockPos(x, baseY + y, z);
-                                for (DecorationDefinition definition : anchoring) {
-                                    DecorationInstance instance = evaluate(level, definition, anchor, null, feasibility);
-                                    if (instance == null) continue;
-                                    if (duplicatesNearby(data, definition, instance)) continue;
-                                    live.add(anchor.asLong());
-                                    DecorationInstance old = data.at(anchor);
-                                    if (old == null || !old.equals(instance)) {
-                                        data.put(instance);
-                                        if (old == null) added++;
-                                    }
-                                }
+                while (sectionIndex < sections.length) {
+                    scanSection(sectionIndex++);
+                    if (System.nanoTime() >= deadline) {
+                        if (sectionIndex < sections.length) return false;
+                        break;
+                    }
+                }
+                if (sectionIndex >= sections.length) {
+                    chunk = null;
+                    nextChunk();
+                }
+                if (System.nanoTime() >= deadline && chunkX <= lastChunkX) return false;
+            }
+            for (DecorationInstance instance : data.within(center, radius * 2)) {
+                BlockPos anchor = instance.anchor();
+                if (anchor.getX() < minX || anchor.getX() > maxX || anchor.getZ() < minZ || anchor.getZ() > maxZ) continue;
+                if (before.contains(anchor.asLong()) && level.isLoaded(anchor) && !live.contains(anchor.asLong())) {
+                    data.remove(anchor);
+                }
+            }
+            finished = true;
+            return true;
+        }
+
+        private void nextChunk() {
+            if (++chunkZ > lastChunkZ) {
+                chunkZ = minZ >> 4;
+                chunkX++;
+            }
+        }
+
+        private void scanSection(int index) {
+            var section = chunk.getSections()[index];
+            if (section == null || section.hasOnlyAir()
+                    || !section.maybeHas(state -> anchorsFor.apply(state).length > 0)) return;
+            int baseY = chunk.getSectionYFromSectionIndex(index) << 4;
+            for (int x = Math.max(minX, chunkX << 4); x <= Math.min(maxX, (chunkX << 4) + 15); x++) {
+                for (int z = Math.max(minZ, chunkZ << 4); z <= Math.min(maxZ, (chunkZ << 4) + 15); z++) {
+                    for (int y = 0; y < 16; y++) {
+                        BlockState state = section.getBlockState(x & 15, y, z & 15);
+                        if (state.isAir()) continue;
+                        DecorationDefinition[] anchoring = anchorsFor.apply(state);
+                        if (anchoring.length == 0) continue;
+                        BlockPos anchor = new BlockPos(x, baseY + y, z);
+                        for (DecorationDefinition definition : anchoring) {
+                            DecorationInstance instance = evaluate(level, definition, anchor, null, feasibility);
+                            if (instance == null) continue;
+                            if (duplicatesNearby(data, definition, instance)) continue;
+                            live.add(anchor.asLong());
+                            DecorationInstance old = data.at(anchor);
+                            if (old == null || !old.equals(instance)) {
+                                data.put(instance);
+                                if (old == null) added++;
                             }
                         }
                     }
                 }
             }
         }
-        for (DecorationInstance instance : data.within(center, radius * 2)) {
-            BlockPos anchor = instance.anchor();
-            if (anchor.getX() < minX || anchor.getX() > maxX || anchor.getZ() < minZ || anchor.getZ() > maxZ) continue;
-            if (level.isLoaded(anchor) && !live.contains(anchor.asLong())) data.remove(anchor);
-        }
-        return added;
     }
 
     /**

@@ -160,77 +160,167 @@ public final class OptionalBuildingRecognition {
      * cannot import a naturally generated village. Refresh deliberately performs the wider pass.
      */
     public static RefreshResult reconcileVillage(ServerLevel level, Village village) {
-        if (level == null || village == null) {
-            return new RefreshResult(0, 0);
-        }
-        removeLegacyMeetingRecords(village);
-        // Records already on the books are judged first, so a wrong one neither survives the
-        // scan nor stretches the village it is measured against.
-        recheckVillage(level, village);
-        List<TypeEntry> types = openAirTypes();
-        if (types.isEmpty()) return new RefreshResult(0, 0);
-        int maxReach = types.stream().mapToInt(TypeEntry::reach).max().orElse(DEFAULT_REACH);
+        RefreshTask task = refreshTask(level, village);
+        task.runToEnd();
+        return task.result();
+    }
 
-        BlockPos center = new BlockPos(village.getCenter().getX(), village.getCenter().getY(),
-                village.getCenter().getZ());
-        var box = village.getBox();
-        // Height comes from the rooms alone: an open-air record is what this scan is checking.
-        int minY = Integer.MAX_VALUE;
-        int maxY = Integer.MIN_VALUE;
-        for (Building building : McaBuildings.all(village)) {
-            if (isRecheckable(level, village, building)) continue;
-            minY = Math.min(minY, building.getPos0().getY());
-            maxY = Math.max(maxY, building.getPos1().getY());
-        }
-        if (minY > maxY) {
-            minY = box.minY();
-            maxY = box.maxY();
-        }
-        int villageReach = Math.max(Math.max(center.getX() - box.minX(), box.maxX() - center.getX()),
-                Math.max(center.getZ() - box.minZ(), box.maxZ() - center.getZ()));
-        int radius = Math.min(160, Math.max(48, villageReach + Math.max(24, maxReach)));
-        List<List<MatchedBlock>> visible = sweep(level, center, radius, types);
-        Rooms rooms = registeredRooms(level, center);
-        SiteRequirements.Scan scan = new SiteRequirements.Scan(level);
-        Set<String> attempted = new HashSet<>();
-        List<Candidate> found = new ArrayList<>();
+    /** The same pass as {@link #reconcileVillage}, in pieces small enough to spread over ticks. */
+    public static RefreshTask refreshTask(ServerLevel level, Village village) {
+        return new RefreshTask(level, village);
+    }
 
-        for (int i = 0; i < types.size(); i++) {
-            TypeEntry entry = types.get(i);
-            List<MatchedBlock> matches = visible.get(i);
-            sortNearestFirst(matches, center);
-            MatchGrid grid = new MatchGrid(matches.size(),
-                    i2 -> matches.get(i2).pos().getX(), i2 -> matches.get(i2).pos().getZ());
-            // Only saves work: a seed inside a site of this type already found finds it again.
-            Set<Long> covered = new HashSet<>();
-            for (MatchedBlock seed : matches) {
-                if (covered.contains(seed.pos().asLong())) continue;
-                if (entry.core() != null && !isCore(entry, seed)) continue;
-                // Mineshafts and caves under the village are not its buildings.
-                if (seed.pos().getY() < minY - VILLAGE_HEIGHT_MARGIN
-                        || seed.pos().getY() > maxY + VILLAGE_HEIGHT_MARGIN) continue;
-                Candidate candidate = assemble(level, scan, seed.pos(), entry, matches, grid, rooms, null);
-                if (candidate == null) continue;
-                candidate.positions().forEach(pos -> covered.add(pos.asLong()));
-                String key = candidate.typeName() + ':' + candidate.min().asLong() + ':' + candidate.max().asLong();
-                if (attempted.add(key)) found.add(candidate);
+    public static final class RefreshTask implements TimeSliced {
+        private enum Phase { RECHECK, SWEEP, ASSEMBLE, DONE }
+
+        private final ServerLevel level;
+        private final Village village;
+        private Phase phase = Phase.DONE;
+        private RecheckTask recheck;
+        private List<TypeEntry> types;
+        private BlockPos center;
+        private int minY;
+        private int maxY;
+        private Sweep sweep;
+        private List<List<MatchedBlock>> visible;
+        private Rooms rooms;
+        private SiteRequirements.Scan scan;
+        private Set<String> attempted;
+        private List<Candidate> found;
+        private int typeIndex = -1;
+        private TypeEntry entry;
+        private List<MatchedBlock> matches;
+        private MatchGrid grid;
+        private Set<Long> covered;
+        private int seedIndex;
+        private RefreshResult result = new RefreshResult(0, 0);
+
+        private RefreshTask(ServerLevel level, Village village) {
+            this.level = level;
+            this.village = village;
+            if (level == null || village == null) return;
+            removeLegacyMeetingRecords(village);
+            // Records already on the books are judged first, so a wrong one neither survives the
+            // scan nor stretches the village it is measured against.
+            recheck = new RecheckTask(level, village);
+            phase = Phase.RECHECK;
+        }
+
+        public RefreshResult result() {
+            return result;
+        }
+
+        @Override
+        public boolean step(long deadline) {
+            if (phase == Phase.RECHECK) {
+                if (!recheck.step(deadline)) return false;
+                beginSweep();
+            }
+            if (phase == Phase.SWEEP) {
+                if (!sweep.step(deadline)) return false;
+                visible = sweep.result();
+                beginAssemble();
+            }
+            if (phase == Phase.ASSEMBLE) {
+                if (!assembleSome(deadline)) return false;
+                finish();
+            }
+            return true;
+        }
+
+        private void beginSweep() {
+            types = openAirTypes();
+            if (types.isEmpty()) {
+                phase = Phase.DONE;
+                return;
+            }
+            int maxReach = types.stream().mapToInt(TypeEntry::reach).max().orElse(DEFAULT_REACH);
+            center = new BlockPos(village.getCenter().getX(), village.getCenter().getY(),
+                    village.getCenter().getZ());
+            var box = village.getBox();
+            // Height comes from the rooms alone: an open-air record is what this scan is checking.
+            minY = Integer.MAX_VALUE;
+            maxY = Integer.MIN_VALUE;
+            for (Building building : McaBuildings.all(village)) {
+                if (isRecheckable(level, village, building)) continue;
+                minY = Math.min(minY, building.getPos0().getY());
+                maxY = Math.max(maxY, building.getPos1().getY());
+            }
+            if (minY > maxY) {
+                minY = box.minY();
+                maxY = box.maxY();
+            }
+            int villageReach = Math.max(Math.max(center.getX() - box.minX(), box.maxX() - center.getX()),
+                    Math.max(center.getZ() - box.minZ(), box.maxZ() - center.getZ()));
+            int radius = Math.min(160, Math.max(48, villageReach + Math.max(24, maxReach)));
+            sweep = new Sweep(level, center, radius, types);
+            phase = Phase.SWEEP;
+        }
+
+        private void beginAssemble() {
+            rooms = registeredRooms(level, center);
+            scan = new SiteRequirements.Scan(level);
+            attempted = new HashSet<>();
+            found = new ArrayList<>();
+            phase = Phase.ASSEMBLE;
+        }
+
+        /** Seeds are taken one at a time; true once every type has been gone through. */
+        private boolean assembleSome(long deadline) {
+            while (true) {
+                if (matches == null) {
+                    typeIndex++;
+                    if (typeIndex >= types.size()) return true;
+                    entry = types.get(typeIndex);
+                    List<MatchedBlock> own = visible.get(typeIndex);
+                    sortNearestFirst(own, center);
+                    matches = own;
+                    grid = new MatchGrid(own.size(),
+                            i2 -> own.get(i2).pos().getX(), i2 -> own.get(i2).pos().getZ());
+                    // Only saves work: a seed inside a site of this type already found finds it again.
+                    covered = new HashSet<>();
+                    seedIndex = 0;
+                }
+                while (seedIndex < matches.size()) {
+                    seedFrom(matches.get(seedIndex++));
+                    if (System.nanoTime() >= deadline) {
+                        if (seedIndex < matches.size() || typeIndex + 1 < types.size()) return false;
+                    }
+                }
+                matches = null;
             }
         }
 
-        // A kept record keeps its kind: the player may have chosen it over a higher priority.
-        found.removeIf(candidate -> !otherKindsOnGround(level, candidate).isEmpty());
-        // Every kind competes at once for the same ground, so the order of the types never decides.
-        found.sort(ranking(false));
-        int created = 0;
-        int refreshed = 0;
-        for (Candidate candidate : SiteGeometry.select(found, OptionalBuildingRecognition::overlap)) {
-            // A site the player removed stays removed until they work on it again.
-            if (DismissedSites.dismissed(level, center(candidate))) continue;
-            Registration registration = register(level, candidate);
-            if (registration == Registration.CREATED) created++;
-            else if (registration == Registration.EXISTING) refreshed++;
+        private void seedFrom(MatchedBlock seed) {
+            if (covered.contains(seed.pos().asLong())) return;
+            if (entry.core() != null && !isCore(entry, seed)) return;
+            // Mineshafts and caves under the village are not its buildings.
+            if (seed.pos().getY() < minY - VILLAGE_HEIGHT_MARGIN
+                    || seed.pos().getY() > maxY + VILLAGE_HEIGHT_MARGIN) return;
+            Candidate candidate = assemble(level, scan, seed.pos(), entry, matches, grid, rooms, null);
+            if (candidate == null) return;
+            candidate.positions().forEach(pos -> covered.add(pos.asLong()));
+            String key = candidate.typeName() + ':' + candidate.min().asLong() + ':' + candidate.max().asLong();
+            if (attempted.add(key)) found.add(candidate);
         }
-        return new RefreshResult(created, refreshed);
+
+        private void finish() {
+            // A kept record keeps its kind: the player may have chosen it over a higher priority.
+            found.removeIf(candidate -> !otherKindsOnGround(level, candidate).isEmpty());
+            // Every kind competes at once for the same ground, so the order of the types never decides.
+            found.sort(ranking(false));
+            int created = 0;
+            int refreshed = 0;
+            for (Candidate candidate : SiteGeometry.select(found, OptionalBuildingRecognition::overlap)) {
+                // A site the player removed stays removed until they work on it again.
+                if (DismissedSites.dismissed(level, center(candidate))) continue;
+                Registration registration = register(level, candidate);
+                if (registration == Registration.CREATED) created++;
+                else if (registration == Registration.EXISTING) refreshed++;
+            }
+            result = new RefreshResult(created, refreshed);
+            phase = Phase.DONE;
+        }
     }
 
     /**
@@ -240,30 +330,82 @@ public final class OptionalBuildingRecognition {
      * not demolished.
      */
     public static RecheckResult recheckVillage(ServerLevel level, Village village) {
-        if (level == null || village == null) return new RecheckResult(0, 0);
-        List<TypeEntry> types = openAirTypes();
-        if (types.isEmpty()) return new RecheckResult(0, 0);
-        Rooms rooms = new Rooms();
-        for (Building building : McaBuildings.all(village)) {
-            if (!McaBuildings.isOpenAirRecord(level, village, building)) {
-                rooms.add(village, building);
+        RecheckTask task = new RecheckTask(level, village);
+        task.runToEnd();
+        return task.result();
+    }
+
+    /** {@link #recheckVillage} one record at a time. */
+    private static final class RecheckTask implements TimeSliced {
+        private final ServerLevel level;
+        private final Village village;
+        private final List<TypeEntry> types;
+        private final Rooms rooms = new Rooms();
+        private final SiteRequirements.Scan scan;
+        private final List<Building> buildings;
+        private final List<Integer> stale = new ArrayList<>();
+        private boolean changed;
+        private int kept;
+        private int index;
+        private boolean done;
+        private RecheckResult result = new RecheckResult(0, 0);
+
+        RecheckTask(ServerLevel level, Village village) {
+            this.level = level;
+            this.village = village;
+            List<TypeEntry> offered = level == null || village == null ? List.of() : openAirTypes();
+            this.types = offered;
+            if (offered.isEmpty()) {
+                this.scan = null;
+                this.buildings = List.of();
+                this.done = true;
+                return;
             }
+            for (Building building : McaBuildings.all(village)) {
+                if (!McaBuildings.isOpenAirRecord(level, village, building)) {
+                    rooms.add(village, building);
+                }
+            }
+            this.scan = new SiteRequirements.Scan(level);
+            this.buildings = List.copyOf(McaBuildings.all(village));
         }
-        SiteRequirements.Scan scan = new SiteRequirements.Scan(level);
-        List<Integer> stale = new ArrayList<>();
-        boolean changed = false;
-        int kept = 0;
-        for (Building building : List.copyOf(McaBuildings.all(village))) {
-            if (!isRecheckable(level, village, building)) continue;
+
+        RecheckResult result() {
+            return result;
+        }
+
+        @Override
+        public boolean step(long deadline) {
+            if (done) return true;
+            while (index < buildings.size()) {
+                recheckOne(buildings.get(index++));
+                if (System.nanoTime() >= deadline && index < buildings.size()) return false;
+            }
+            for (int id : stale) {
+                changed |= McaBuildings.remove(village, id);
+                Townstead.LOGGER.info("[OptionalBuilding] removed open-air building {} from village {}: "
+                        + "it no longer qualifies", id, village.getId());
+            }
+            if (changed) {
+                village.calculateDimensions();
+                village.markDirty();
+            }
+            result = new RecheckResult(kept, stale.size());
+            done = true;
+            return true;
+        }
+
+        private void recheckOne(Building building) {
+            if (!isRecheckable(level, village, building)) return;
             List<TypeEntry> family = types.stream()
                     .filter(entry -> sameOpenAirSiteFamily(entry.name(), building.getType()))
                     .toList();
             // A type this pack no longer offers is the sanitizer's to retire, not ours to judge.
-            if (family.isEmpty() || !loaded(level, building, family)) continue;
+            if (family.isEmpty() || !loaded(level, building, family)) return;
             Candidate again = recognizeAgain(level, scan, building, family, rooms);
             if (again == null) {
                 stale.add(building.getId());
-                continue;
+                return;
             }
             kept++;
             if (!again.typeName().equals(building.getType())
@@ -272,16 +414,6 @@ public final class OptionalBuildingRecognition {
                 changed = true;
             }
         }
-        for (int id : stale) {
-            changed |= McaBuildings.remove(village, id);
-            Townstead.LOGGER.info("[OptionalBuilding] removed open-air building {} from village {}: "
-                    + "it no longer qualifies", id, village.getId());
-        }
-        if (changed) {
-            village.calculateDimensions();
-            village.markDirty();
-        }
-        return new RecheckResult(kept, stale.size());
     }
 
     /**
@@ -711,42 +843,75 @@ public final class OptionalBuildingRecognition {
      */
     private static List<List<MatchedBlock>> sweep(
             ServerLevel level, BlockPos origin, int radius, List<TypeEntry> types) {
-        List<List<MatchedBlock>> visible = new ArrayList<>();
-        for (int i = 0; i < types.size(); i++) visible.add(new ArrayList<>());
-        Map<BlockState, int[]> wantedBy = new HashMap<>();
-        java.util.function.Function<BlockState, int[]> wanted = state ->
-                wantedBy.computeIfAbsent(state, key -> typesMatching(types, key));
+        Sweep sweep = new Sweep(level, origin, radius, types);
+        sweep.runToEnd();
+        return sweep.result();
+    }
 
-        int minX = origin.getX() - radius, maxX = origin.getX() + radius;
-        int minZ = origin.getZ() - radius, maxZ = origin.getZ() + radius;
-        for (int chunkX = minX >> 4; chunkX <= maxX >> 4; chunkX++) {
-            for (int chunkZ = minZ >> 4; chunkZ <= maxZ >> 4; chunkZ++) {
-                if (!level.hasChunk(chunkX, chunkZ)) continue;
-                LevelChunk chunk = level.getChunk(chunkX, chunkZ);
-                LevelChunkSection[] sections = chunk.getSections();
-                for (int index = 0; index < sections.length; index++) {
-                    LevelChunkSection section = sections[index];
-                    if (section == null || section.hasOnlyAir()
-                            || !section.maybeHas(state -> wanted.apply(state).length > 0)) continue;
-                    int baseY = chunk.getSectionYFromSectionIndex(index) << 4;
-                    for (int x = Math.max(minX, chunkX << 4); x <= Math.min(maxX, (chunkX << 4) + 15); x++) {
-                        for (int z = Math.max(minZ, chunkZ << 4); z <= Math.min(maxZ, (chunkZ << 4) + 15); z++) {
-                            for (int y = 0; y < 16; y++) {
-                                BlockState state = section.getBlockState(x & 15, y, z & 15);
-                                if (state.isAir()) continue;
-                                int[] owners = wanted.apply(state);
-                                if (owners.length == 0) continue;
-                                MatchedBlock matched = new MatchedBlock(
-                                        net.minecraft.core.registries.BuiltInRegistries.BLOCK.getKey(state.getBlock()),
-                                        state.getBlock(), new BlockPos(x, baseY + y, z));
-                                for (int owner : owners) visible.get(owner).add(matched);
-                            }
+    /** {@link #sweep} one chunk at a time. */
+    private static final class Sweep implements TimeSliced {
+        private final ServerLevel level;
+        private final List<List<MatchedBlock>> visible = new ArrayList<>();
+        private final java.util.function.Function<BlockState, int[]> wanted;
+        private final int minX, maxX, minZ, maxZ, lastChunkX, lastChunkZ;
+        private int chunkX, chunkZ;
+
+        Sweep(ServerLevel level, BlockPos origin, int radius, List<TypeEntry> types) {
+            this.level = level;
+            for (int i = 0; i < types.size(); i++) visible.add(new ArrayList<>());
+            Map<BlockState, int[]> wantedBy = new HashMap<>();
+            this.wanted = state -> wantedBy.computeIfAbsent(state, key -> typesMatching(types, key));
+            minX = origin.getX() - radius;
+            maxX = origin.getX() + radius;
+            minZ = origin.getZ() - radius;
+            maxZ = origin.getZ() + radius;
+            chunkX = minX >> 4;
+            chunkZ = minZ >> 4;
+            lastChunkX = maxX >> 4;
+            lastChunkZ = maxZ >> 4;
+        }
+
+        List<List<MatchedBlock>> result() {
+            return visible;
+        }
+
+        @Override
+        public boolean step(long deadline) {
+            while (chunkX <= lastChunkX) {
+                if (level.hasChunk(chunkX, chunkZ)) scanChunk(chunkX, chunkZ);
+                if (++chunkZ > lastChunkZ) {
+                    chunkZ = minZ >> 4;
+                    chunkX++;
+                }
+                if (System.nanoTime() >= deadline && chunkX <= lastChunkX) return false;
+            }
+            return true;
+        }
+
+        private void scanChunk(int chunkX, int chunkZ) {
+            LevelChunk chunk = level.getChunk(chunkX, chunkZ);
+            LevelChunkSection[] sections = chunk.getSections();
+            for (int index = 0; index < sections.length; index++) {
+                LevelChunkSection section = sections[index];
+                if (section == null || section.hasOnlyAir()
+                        || !section.maybeHas(state -> wanted.apply(state).length > 0)) continue;
+                int baseY = chunk.getSectionYFromSectionIndex(index) << 4;
+                for (int x = Math.max(minX, chunkX << 4); x <= Math.min(maxX, (chunkX << 4) + 15); x++) {
+                    for (int z = Math.max(minZ, chunkZ << 4); z <= Math.min(maxZ, (chunkZ << 4) + 15); z++) {
+                        for (int y = 0; y < 16; y++) {
+                            BlockState state = section.getBlockState(x & 15, y, z & 15);
+                            if (state.isAir()) continue;
+                            int[] owners = wanted.apply(state);
+                            if (owners.length == 0) continue;
+                            MatchedBlock matched = new MatchedBlock(
+                                    net.minecraft.core.registries.BuiltInRegistries.BLOCK.getKey(state.getBlock()),
+                                    state.getBlock(), new BlockPos(x, baseY + y, z));
+                            for (int owner : owners) visible.get(owner).add(matched);
                         }
                     }
                 }
             }
         }
-        return visible;
     }
 
     private static int[] typesMatching(List<TypeEntry> types, BlockState state) {
